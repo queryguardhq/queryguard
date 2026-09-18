@@ -62,9 +62,46 @@ function resolveConfig() {
 function extractColumn(filterClause) {
     if (!filterClause)
         return null;
-    // Matches patterns like "(organization_id = 42)" or "(created_at > ...)"
     const match = filterClause.match(/\(?([a-zA-Z_0-9]+)\s*(=|>|<|>=|<=|~~|LIKE|IN)/i);
     return match ? match[1] : null;
+}
+async function postGithubComment(token, report) {
+    const eventPath = process.env.GITHUB_EVENT_PATH;
+    if (!eventPath || !fs.existsSync(eventPath)) {
+        console.log('[QueryGuard] GITHUB_EVENT_PATH not found. Skipping PR comment.');
+        return;
+    }
+    const eventData = JSON.parse(fs.readFileSync(eventPath, 'utf8'));
+    const prNumber = eventData.pull_request?.number;
+    const repository = process.env.GITHUB_REPOSITORY;
+    if (!prNumber || !repository) {
+        console.log(`[QueryGuard] Not in a PR context (PR: ${prNumber}, Repo: ${repository}). Skipping comment.`);
+        return;
+    }
+    const apiUrl = `https://api.github.com/repos/${repository}/issues/${prNumber}/comments`;
+    console.log(`[QueryGuard] Posting report to PR #${prNumber} at ${apiUrl}...`);
+    try {
+        const response = await fetch(apiUrl, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${token}`,
+                'Accept': 'application/vnd.github.v3+json',
+                'Content-Type': 'application/json',
+                'User-Agent': 'QueryGuard-CI',
+            },
+            body: JSON.stringify({ body: report }),
+        });
+        if (!response.ok) {
+            const errBody = await response.text();
+            console.error(`[QueryGuard] GitHub API error (Status ${response.status}): ${errBody}`);
+        }
+        else {
+            console.log('[QueryGuard] Successfully posted comment to PR!');
+        }
+    }
+    catch (err) {
+        console.error(`[QueryGuard] Network error posting to GitHub: ${err.message}`);
+    }
 }
 async function run() {
     const config = resolveConfig();
@@ -116,7 +153,7 @@ async function run() {
                         const col = extractColumn(node['Filter']);
                         const indexSql = col
                             ? `CREATE INDEX CONCURRENTLY idx_${table}_${col} ON ${table}(${col});`
-                            : `CREATE INDEX CONCURRENTLY idx_${table}_scan ON${table}(/* columns */);`;
+                            : `CREATE INDEX CONCURRENTLY idx_${table}_scan ON ${table}(/* columns */);`;
                         findings.push({
                             query: sql,
                             totalCost: plan.Plan['Total Cost'],
@@ -136,6 +173,12 @@ async function run() {
         const reportMarkdown = (0, reporter_1.buildMarkdownReport)(findings);
         fs.writeFileSync('queryguard-report.md', reportMarkdown);
         console.log('\n' + reportMarkdown);
+        if (config.githubToken) {
+            await postGithubComment(config.githubToken, reportMarkdown);
+        }
+        else {
+            console.log('[QueryGuard] No GITHUB_TOKEN provided; skipping PR comment.');
+        }
         const severeCount = findings.filter(f => f.hasSeqScan).length;
         if (severeCount > 0 && config.failOnSev1) {
             console.error(`\n[QueryGuard] Blocked: Found ${severeCount} unindexed query patterns.`);

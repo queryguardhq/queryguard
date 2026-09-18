@@ -2,10 +2,6 @@ name: QueryGuard PR Sentinel
 
 on:
   pull_request:
-    paths:
-      - 'test/**'
-      - 'src/**'
-      - '**/*.sql'
 
 permissions:
   pull-requests: write
@@ -59,3 +55,4 @@ jobs:
           PG_DATABASE: testdb
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_EVENT_PATH: ${{ github.event_path }}
+          GITHUB_REPOSITORY: ${{ github.repository }}

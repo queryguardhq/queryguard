@@ -53,6 +53,7 @@ jobs:
           PG_USER: postgres
           PG_PASSWORD: postgres
           PG_DATABASE: testdb
+          FAIL_ON_SEV1: 'true'
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_EVENT_PATH: ${{ github.event_path }}
           GITHUB_REPOSITORY: ${{ github.repository }}

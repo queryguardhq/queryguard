@@ -37,6 +37,7 @@ const pg_1 = require("pg");
 const fs = __importStar(require("fs"));
 const path = __importStar(require("path"));
 const reporter_1 = require("./reporter");
+const BOT_MARKER = '<!-- queryguard:blast-radius-report -->';
 function getParam(flag, actionInputKey, fallback) {
     const idx = process.argv.indexOf(flag);
     if (idx !== -1 && process.argv[idx + 1]) {
@@ -65,42 +66,76 @@ function extractColumn(filterClause) {
     const match = filterClause.match(/\(?([a-zA-Z_0-9]+)\s*(=|>|<|>=|<=|~~|LIKE|IN)/i);
     return match ? match[1] : null;
 }
-async function postGithubComment(token, report) {
+async function upsertGithubComment(token, report) {
     const eventPath = process.env.GITHUB_EVENT_PATH;
     if (!eventPath || !fs.existsSync(eventPath)) {
-        console.log('[QueryGuard] GITHUB_EVENT_PATH not found. Skipping PR comment.');
+        console.log('[QueryGuard] GITHUB_EVENT_PATH missing; skipping comment.');
         return;
     }
     const eventData = JSON.parse(fs.readFileSync(eventPath, 'utf8'));
     const prNumber = eventData.pull_request?.number;
     const repository = process.env.GITHUB_REPOSITORY;
     if (!prNumber || !repository) {
-        console.log(`[QueryGuard] Not in a PR context (PR: ${prNumber}, Repo: ${repository}). Skipping comment.`);
+        console.log(`[QueryGuard] Non-PR context (PR: ${prNumber}, Repo: ${repository}); skipping comment.`);
         return;
     }
-    const apiUrl = `https://api.github.com/repos/${repository}/issues/${prNumber}/comments`;
-    console.log(`[QueryGuard] Posting report to PR #${prNumber} at ${apiUrl}...`);
+    const commentsUrl = `https://api.github.com/repos/${repository}/issues/${prNumber}/comments`;
+    const bodyWithMarker = `${BOT_MARKER}\n${report}`;
+    const headers = {
+        'Authorization': `Bearer ${token}`,
+        'Accept': 'application/vnd.github.v3+json',
+        'Content-Type': 'application/json',
+        'User-Agent': 'QueryGuard-CI',
+    };
     try {
-        const response = await fetch(apiUrl, {
-            method: 'POST',
-            headers: {
-                'Authorization': `Bearer ${token}`,
-                'Accept': 'application/vnd.github.v3+json',
-                'Content-Type': 'application/json',
-                'User-Agent': 'QueryGuard-CI',
-            },
-            body: JSON.stringify({ body: report }),
-        });
-        if (!response.ok) {
-            const errBody = await response.text();
-            console.error(`[QueryGuard] GitHub API error (Status ${response.status}): ${errBody}`);
+        // 1. Fetch existing comments on the PR
+        console.log(`[QueryGuard] Searching existing PR comments for previous report...`);
+        const listRes = await fetch(commentsUrl, { headers });
+        if (!listRes.ok) {
+            console.warn(`[QueryGuard] Could not list comments (Status ${listRes.status}). Attempting fresh POST...`);
+            await fetch(commentsUrl, { method: 'POST', headers, body: JSON.stringify({ body: bodyWithMarker }) });
+            return;
+        }
+        const comments = await listRes.json();
+        const existingComment = Array.isArray(comments)
+            ? comments.find((c) => c.body && c.body.includes(BOT_MARKER))
+            : null;
+        if (existingComment) {
+            // 2. Update existing comment in place
+            console.log(`[QueryGuard] Found existing report comment (ID: ${existingComment.id}). Updating in place...`);
+            const updateUrl = `https://api.github.com/repos/${repository}/issues/comments/${existingComment.id}`;
+            const patchRes = await fetch(updateUrl, {
+                method: 'PATCH',
+                headers,
+                body: JSON.stringify({ body: bodyWithMarker }),
+            });
+            if (patchRes.ok) {
+                console.log('[QueryGuard] In-place PR comment successfully updated.');
+            }
+            else {
+                const err = await patchRes.text();
+                console.error(`[QueryGuard] Failed updating comment: ${err}`);
+            }
         }
         else {
-            console.log('[QueryGuard] Successfully posted comment to PR!');
+            // 3. Post a new comment
+            console.log(`[QueryGuard] No prior report comment found. Creating new comment...`);
+            const postRes = await fetch(commentsUrl, {
+                method: 'POST',
+                headers,
+                body: JSON.stringify({ body: bodyWithMarker }),
+            });
+            if (postRes.ok) {
+                console.log('[QueryGuard] Successfully created initial PR comment.');
+            }
+            else {
+                const err = await postRes.text();
+                console.error(`[QueryGuard] Failed posting comment: ${err}`);
+            }
         }
     }
     catch (err) {
-        console.error(`[QueryGuard] Network error posting to GitHub: ${err.message}`);
+        console.error(`[QueryGuard] API error during comment upsert: ${err.message}`);
     }
 }
 async function run() {
@@ -112,7 +147,7 @@ async function run() {
         password: config.pgPass,
         database: config.pgDb,
     });
-    console.log(`[QueryGuard] Connecting to ${config.pgHost}:${config.pgPort}/${config.pgDb}...`);
+    console.log(`[QueryGuard] Connecting to database at ${config.pgHost}:${config.pgPort}/${config.pgDb}...`);
     await client.connect();
     try {
         const resolvedSchema = path.resolve(config.schemaPath);
@@ -173,15 +208,14 @@ async function run() {
         const reportMarkdown = (0, reporter_1.buildMarkdownReport)(findings);
         fs.writeFileSync('queryguard-report.md', reportMarkdown);
         console.log('\n' + reportMarkdown);
+        // Post or update the PR comment first so the team sees the explanation
         if (config.githubToken) {
-            await postGithubComment(config.githubToken, reportMarkdown);
+            await upsertGithubComment(config.githubToken, reportMarkdown);
         }
-        else {
-            console.log('[QueryGuard] No GITHUB_TOKEN provided; skipping PR comment.');
-        }
+        // Gate CI if critical scans exist
         const severeCount = findings.filter(f => f.hasSeqScan).length;
         if (severeCount > 0 && config.failOnSev1) {
-            console.error(`\n[QueryGuard] Blocked: Found ${severeCount} unindexed query patterns.`);
+            console.error(`\n[QueryGuard] CI GATING FAILURE: Detected ${severeCount} unindexed query pattern(s) with critical blast-radius.`);
             process.exit(1);
         }
     }

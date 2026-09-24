@@ -2,8 +2,10 @@ import { Finding } from './types';
 
 export function buildMarkdownReport(findings: Finding[]): string {
   const severe = findings.filter(f => f.hasSeqScan);
+  const now = new Date().toISOString().replace('T', ' ').substring(0, 19) + ' UTC';
 
   let md = `## 🛡️ QueryGuard Pre-Merge Blast-Radius Report\n\n`;
+  md += `*Last evaluated: \`${now}\`*\n\n`;
 
   if (severe.length === 0) {
     md += `✅ **All evaluated queries execute indexed scans.** Zero full table scans detected.\n`;

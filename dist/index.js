@@ -76,7 +76,7 @@ async function upsertGithubComment(token, report) {
     const prNumber = eventData.pull_request?.number;
     const repository = process.env.GITHUB_REPOSITORY;
     if (!prNumber || !repository) {
-        console.log(`[QueryGuard] Non-PR context (PR: ${prNumber}, Repo: ${repository}); skipping comment.`);
+        console.log(`[QueryGuard] Non-PR context (PR: ${prNumber}, Repo:${repository}); skipping comment.`);
         return;
     }
     const commentsUrl = `https://api.github.com/repos/${repository}/issues/${prNumber}/comments`;
@@ -88,11 +88,10 @@ async function upsertGithubComment(token, report) {
         'User-Agent': 'QueryGuard-CI',
     };
     try {
-        // 1. Fetch existing comments on the PR
-        console.log(`[QueryGuard] Searching existing PR comments for previous report...`);
+        console.log(`[QueryGuard] Fetching existing PR comments from ${commentsUrl}...`);
         const listRes = await fetch(commentsUrl, { headers });
         if (!listRes.ok) {
-            console.warn(`[QueryGuard] Could not list comments (Status ${listRes.status}). Attempting fresh POST...`);
+            console.warn(`[QueryGuard] Could not list comments (Status ${listRes.status}). Posting new comment...`);
             await fetch(commentsUrl, { method: 'POST', headers, body: JSON.stringify({ body: bodyWithMarker }) });
             return;
         }
@@ -101,7 +100,6 @@ async function upsertGithubComment(token, report) {
             ? comments.find((c) => c.body && c.body.includes(BOT_MARKER))
             : null;
         if (existingComment) {
-            // 2. Update existing comment in place
             console.log(`[QueryGuard] Found existing report comment (ID: ${existingComment.id}). Updating in place...`);
             const updateUrl = `https://api.github.com/repos/${repository}/issues/comments/${existingComment.id}`;
             const patchRes = await fetch(updateUrl, {
@@ -118,8 +116,7 @@ async function upsertGithubComment(token, report) {
             }
         }
         else {
-            // 3. Post a new comment
-            console.log(`[QueryGuard] No prior report comment found. Creating new comment...`);
+            console.log(`[QueryGuard] No prior comment with marker found. Creating new comment...`);
             const postRes = await fetch(commentsUrl, {
                 method: 'POST',
                 headers,
@@ -156,10 +153,17 @@ async function run() {
         await client.query(ddl);
         const resolvedQueries = path.resolve(config.queriesPath);
         console.log(`[QueryGuard] Evaluating queries: ${resolvedQueries}`);
-        const queryStatements = fs.readFileSync(resolvedQueries, 'utf8')
+        const rawSql = fs.readFileSync(resolvedQueries, 'utf8');
+        // Strip single-line comments line-by-line so multi-line queries are preserved
+        const sanitizedSql = rawSql
+            .split('\n')
+            .filter(line => !line.trim().startsWith('--'))
+            .join('\n');
+        const queryStatements = sanitizedSql
             .split(';')
             .map(q => q.trim())
-            .filter(q => q.length > 0 && !q.startsWith('--'));
+            .filter(q => q.length > 0);
+        console.log(`[QueryGuard] Parsed ${queryStatements.length} executable SQL statement(s).`);
         const findings = [];
         for (const sql of queryStatements) {
             try {
@@ -188,7 +192,7 @@ async function run() {
                         const col = extractColumn(node['Filter']);
                         const indexSql = col
                             ? `CREATE INDEX CONCURRENTLY idx_${table}_${col} ON ${table}(${col});`
-                            : `CREATE INDEX CONCURRENTLY idx_${table}_scan ON ${table}(/* columns */);`;
+                            : `CREATE INDEX CONCURRENTLY idx_${table}_scan ON${table}(/* columns */);`;
                         findings.push({
                             query: sql,
                             totalCost: plan.Plan['Total Cost'],
@@ -208,11 +212,11 @@ async function run() {
         const reportMarkdown = (0, reporter_1.buildMarkdownReport)(findings);
         fs.writeFileSync('queryguard-report.md', reportMarkdown);
         console.log('\n' + reportMarkdown);
-        // Post or update the PR comment first so the team sees the explanation
+        // Upsert the comment before exiting
         if (config.githubToken) {
             await upsertGithubComment(config.githubToken, reportMarkdown);
         }
-        // Gate CI if critical scans exist
+        // Block merge if critical sequential scans are present
         const severeCount = findings.filter(f => f.hasSeqScan).length;
         if (severeCount > 0 && config.failOnSev1) {
             console.error(`\n[QueryGuard] CI GATING FAILURE: Detected ${severeCount} unindexed query pattern(s) with critical blast-radius.`);

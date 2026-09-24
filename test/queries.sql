@@ -7,8 +7,6 @@ FROM users u
 JOIN audit_logs a ON u.id = a.user_id 
 WHERE a.created_at > NOW() - INTERVAL '30 minutes';
 
--- 4. New unindexed email filter
 SELECT * FROM users WHERE email = 'target_user@company.com';
 
--- Intentional regression: unindexed status scan
 SELECT * FROM users WHERE status = 'pending';

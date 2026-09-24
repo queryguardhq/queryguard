@@ -16,7 +16,7 @@ CREATE TABLE audit_logs (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
--- Seed 10,000 synthetic rows
+-- Seed synthetic rows
 INSERT INTO users (organization_id, email, status)
 SELECT (i % 50), 'user_' || i || '@company.com', CASE WHEN i % 2 = 0 THEN 'active' ELSE 'pending' END
 FROM generate_series(1, 10000) i;
@@ -25,11 +25,14 @@ INSERT INTO audit_logs (user_id, action, created_at)
 SELECT (i % 10000) + 1, 'USER_LOGIN', CURRENT_TIMESTAMP - (i || ' minutes')::interval
 FROM generate_series(1, 10000) i;
 
--- Covering indexes for earlier queries
+-- Valid indexes
 CREATE INDEX idx_users_organization_id ON users(organization_id);
 CREATE INDEX idx_users_email ON users(email);
 CREATE INDEX idx_audit_logs_created_at ON audit_logs(created_at);
 CREATE INDEX idx_audit_logs_user_id ON audit_logs(user_id);
+
+-- Intentional lock hazard: CREATE INDEX without CONCURRENTLY
+CREATE INDEX idx_users_status_non_concurrent ON users(status);
 
 ANALYZE users;
 ANALYZE audit_logs;

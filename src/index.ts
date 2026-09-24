@@ -36,6 +36,63 @@ function extractColumn(filterClause?: string): string | null {
   return match ? match[1] : null;
 }
 
+function analyzeDDLLocks(ddlRaw: string): Finding[] {
+  const findings: Finding[] = [];
+  
+  // Clean comments and break down DDL statements
+  const sanitizedDDL = ddlRaw
+    .split('\n')
+    .filter(line => !line.trim().startsWith('--'))
+    .join('\n');
+
+  const statements = sanitizedDDL
+    .split(';')
+    .map(s => s.trim())
+    .filter(s => s.length > 0);
+
+  for (const stmt of statements) {
+    // 1. Detect CREATE INDEX lacking CONCURRENTLY (Acquires SHARE lock, blocks table writes)
+    const isCreateIndex = /^\s*CREATE\s+(UNIQUE\s+)?INDEX/i.test(stmt);
+    const hasConcurrently = /\bCONCURRENTLY\b/i.test(stmt);
+
+    if (isCreateIndex && !hasConcurrently) {
+      const match = stmt.match(/CREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?([a-zA-Z0-9_]+)\s+ON\s+(?:ONLY\s+)?([a-zA-Z0-9_]+)/i);
+      const indexName = match ? match[1] : 'idx_name';
+      const tableName = match ? match[2] : 'target_table';
+
+      findings.push({
+        query: stmt,
+        totalCost: 0,
+        hasSeqScan: false,
+        isLockRisk: true,
+        lockType: 'SHARE (Table Write Lock)',
+        targetTable: tableName,
+        recommendation: `Use \`CREATE INDEX CONCURRENTLY ${indexName} ON${tableName}...\` to prevent blocking concurrent inserts/updates.`,
+      });
+    }
+
+    // 2. Detect ALTER COLUMN TYPE (Acquires ACCESS EXCLUSIVE lock and forces table rewrite)
+    const isAlterColumnType = /ALTER\s+TABLE\s+([a-zA-Z0-9_]+)\s+ALTER\s+COLUMN\s+([a-zA-Z0-9_]+)\s+(?:SET\s+DATA\s+)?TYPE/i.test(stmt);
+    if (isAlterColumnType) {
+      const match = stmt.match(/ALTER\s+TABLE\s+([a-zA-Z0-9_]+)\s+ALTER\s+COLUMN\s+([a-zA-Z0-9_]+)/i);
+      const tableName = match ? match[1] : 'target_table';
+      const columnName = match ? match[2] : 'col_name';
+
+      findings.push({
+        query: stmt,
+        totalCost: 0,
+        hasSeqScan: false,
+        isLockRisk: true,
+        lockType: 'ACCESS EXCLUSIVE',
+        targetTable: tableName,
+        recommendation: `Altering \`${tableName}.${columnName}\` type acquires \`ACCESS EXCLUSIVE\` and rewrites table. Stage transition via a new column.`,
+      });
+    }
+  }
+
+  return findings;
+}
+
 async function upsertGithubComment(token: string, report: string) {
   const eventPath = process.env.GITHUB_EVENT_PATH;
   if (!eventPath || !fs.existsSync(eventPath)) {
@@ -89,7 +146,6 @@ async function upsertGithubComment(token: string, report: string) {
       console.warn(`[QueryGuard] PATCH failed (Status ${patchRes.status}). Falling back to POST...`);
     }
 
-    // POST fallback if no existing comment or if PATCH failed
     console.log(`[QueryGuard] Creating new comment...`);
     const postRes = await fetch(commentsUrl, {
       method: 'POST',
@@ -123,10 +179,17 @@ async function run() {
 
   try {
     const resolvedSchema = path.resolve(config.schemaPath);
-    console.log(`[QueryGuard] Applying schema: ${resolvedSchema}`);
+    console.log(`[QueryGuard] Inspecting schema DDL: ${resolvedSchema}`);
     const ddl = fs.readFileSync(resolvedSchema, 'utf8');
+
+    // 1. Analyze Migration & DDL Locks First
+    const lockFindings = analyzeDDLLocks(ddl);
+    console.log(`[QueryGuard] Detected ${lockFindings.length} dangerous DDL lock patterns.`);
+
+    // 2. Apply Schema to Ephemeral PostgreSQL Database
     await client.query(ddl);
 
+    // 3. Evaluate SQL Query Plans
     const resolvedQueries = path.resolve(config.queriesPath);
     console.log(`[QueryGuard] Evaluating queries: ${resolvedQueries}`);
     const rawSql = fs.readFileSync(resolvedQueries, 'utf8');
@@ -141,9 +204,7 @@ async function run() {
       .map(q => q.trim())
       .filter(q => q.length > 0);
 
-    console.log(`[QueryGuard] Parsed ${queryStatements.length} executable SQL statement(s).`);
-
-    const findings: Finding[] = [];
+    const scanFindings: Finding[] = [];
 
     for (const sql of queryStatements) {
       try {
@@ -164,7 +225,7 @@ async function run() {
         walkPlan(plan.Plan);
 
         if (seqScanNodes.length === 0) {
-          findings.push({
+          scanFindings.push({
             query: sql,
             totalCost: plan.Plan['Total Cost'],
             hasSeqScan: false,
@@ -177,7 +238,7 @@ async function run() {
               ? `CREATE INDEX CONCURRENTLY idx_${table}_${col} ON ${table}(${col});`
               : `CREATE INDEX CONCURRENTLY idx_${table}_scan ON ${table}(/* columns */);`;
 
-            findings.push({
+            scanFindings.push({
               query: sql,
               totalCost: plan.Plan['Total Cost'],
               hasSeqScan: true,
@@ -193,7 +254,8 @@ async function run() {
       }
     }
 
-    const reportMarkdown = buildMarkdownReport(findings);
+    const allFindings = [...lockFindings, ...scanFindings];
+    const reportMarkdown = buildMarkdownReport(allFindings);
     fs.writeFileSync('queryguard-report.md', reportMarkdown);
     console.log('\n' + reportMarkdown);
 
@@ -201,9 +263,10 @@ async function run() {
       await upsertGithubComment(config.githubToken, reportMarkdown);
     }
 
-    const severeCount = findings.filter(f => f.hasSeqScan).length;
-    if (severeCount > 0 && config.failOnSev1) {
-      console.error(`\n[QueryGuard] CI GATING FAILURE: Detected ${severeCount} unindexed query pattern(s) with critical blast-radius.`);
+    // CI Gating: Block merge on unindexed scans OR blocking locks
+    const criticalIssues = allFindings.filter(f => f.hasSeqScan || f.isLockRisk);
+    if (criticalIssues.length > 0 && config.failOnSev1) {
+      console.error(`\n[QueryGuard] CI GATING FAILURE: Detected ${criticalIssues.length} critical database risk(s).`);
       process.exit(1);
     }
   } finally {

@@ -7,7 +7,7 @@ function buildMarkdownReport(findings) {
     let md = `## 🛡️ QueryGuard Pre-Merge Blast-Radius Report\n\n`;
     md += `*Last evaluated: \`${now}\`*\n\n`;
     if (severe.length === 0) {
-        md += `✅ **All checks passed.** Zero unindexed full table scans and zero blocking \`ACCESS EXCLUSIVE\` migration locks detected.\n`;
+        md += `✅ **All checks passed.** Zero unindexed full table scans and zero blocking migration locks detected.\n`;
         return md;
     }
     md += `⚠️ **High Blast-Radius Warning:** Detected **${severe.length}** risky database pattern(s).\n\n`;
@@ -17,7 +17,10 @@ function buildMarkdownReport(findings) {
         const table = f.targetTable || 'unknown';
         if (f.isLockRisk) {
             const lockLabel = f.lockType || 'ACCESS EXCLUSIVE';
-            md += `| 🚨 CRITICAL | \`${lockLabel}\` Lock | \`${table}\` | Blocks all concurrent reads/writes | ${f.recommendation} |\n`;
+            const blastRadius = lockLabel === 'SHARE'
+                ? 'Blocks concurrent table writes (`INSERT`/`UPDATE`/`DELETE`)'
+                : 'Blocks all concurrent `SELECT` queries and writes';
+            md += `| 🚨 CRITICAL | \`${lockLabel}\` Lock | \`${table}\` | ${blastRadius} \vert{}${f.recommendation} |\n`;
         }
         else {
             const rows = (f.impactedRows || 0).toLocaleString();

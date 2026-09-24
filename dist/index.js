@@ -63,22 +63,25 @@ function resolveConfig() {
 function extractColumn(filterClause) {
     if (!filterClause)
         return null;
-    const match = filterClause.match(/\(?([a-zA-Z_0-9]+)\s*(=|>|<|>=|<=|~~|LIKE|IN)/i);
+    // Strip PostgreSQL type-casts like "::text" or "::character varying"
+    const cleanFilter = filterClause.replace(/::[a-zA-Z0-9_ ]+/g, '');
+    // Extract column name on left-hand side of operator
+    const match = cleanFilter.match(/\(?([a-zA-Z_0-9]+)\)?\s*(=|>|<|>=|<=|~~|LIKE|IN)/i);
     return match ? match[1] : null;
 }
-function analyzeDDLLocks(ddlRaw) {
-    const findings = [];
-    // Clean comments and break down DDL statements
-    const sanitizedDDL = ddlRaw
+function splitSqlStatements(sqlContent) {
+    const sanitized = sqlContent
         .split('\n')
         .filter(line => !line.trim().startsWith('--'))
         .join('\n');
-    const statements = sanitizedDDL
+    return sanitized
         .split(';')
         .map(s => s.trim())
         .filter(s => s.length > 0);
+}
+function analyzeDDLLocks(statements) {
+    const findings = [];
     for (const stmt of statements) {
-        // 1. Detect CREATE INDEX lacking CONCURRENTLY (Acquires SHARE lock, blocks table writes)
         const isCreateIndex = /^\s*CREATE\s+(UNIQUE\s+)?INDEX/i.test(stmt);
         const hasConcurrently = /\bCONCURRENTLY\b/i.test(stmt);
         if (isCreateIndex && !hasConcurrently) {
@@ -90,12 +93,11 @@ function analyzeDDLLocks(ddlRaw) {
                 totalCost: 0,
                 hasSeqScan: false,
                 isLockRisk: true,
-                lockType: 'SHARE (Table Write Lock)',
+                lockType: 'SHARE',
                 targetTable: tableName,
-                recommendation: `Use \`CREATE INDEX CONCURRENTLY ${indexName} ON${tableName}...\` to prevent blocking concurrent inserts/updates.`,
+                recommendation: `Use \`CREATE INDEX CONCURRENTLY ${indexName} ON ${tableName} ...\` to prevent blocking writes.`,
             });
         }
-        // 2. Detect ALTER COLUMN TYPE (Acquires ACCESS EXCLUSIVE lock and forces table rewrite)
         const isAlterColumnType = /ALTER\s+TABLE\s+([a-zA-Z0-9_]+)\s+ALTER\s+COLUMN\s+([a-zA-Z0-9_]+)\s+(?:SET\s+DATA\s+)?TYPE/i.test(stmt);
         if (isAlterColumnType) {
             const match = stmt.match(/ALTER\s+TABLE\s+([a-zA-Z0-9_]+)\s+ALTER\s+COLUMN\s+([a-zA-Z0-9_]+)/i);
@@ -108,7 +110,7 @@ function analyzeDDLLocks(ddlRaw) {
                 isLockRisk: true,
                 lockType: 'ACCESS EXCLUSIVE',
                 targetTable: tableName,
-                recommendation: `Altering \`${tableName}.${columnName}\` type acquires \`ACCESS EXCLUSIVE\` and rewrites table. Stage transition via a new column.`,
+                recommendation: `Altering \`${tableName}.${columnName}\` type rewrites table and blocks all reads/writes.`,
             });
         }
     }
@@ -124,7 +126,7 @@ async function upsertGithubComment(token, report) {
     const prNumber = eventData.pull_request?.number;
     const repository = process.env.GITHUB_REPOSITORY;
     if (!prNumber || !repository) {
-        console.log(`[QueryGuard] Non-PR context (PR: ${prNumber}, Repo: ${repository}); skipping comment.`);
+        console.log(`[QueryGuard] Non-PR context (PR: ${prNumber}, Repo:${repository}); skipping comment.`);
         return;
     }
     const commentsUrl = `https://api.github.com/repos/${repository}/issues/${prNumber}/comments`;
@@ -136,7 +138,6 @@ async function upsertGithubComment(token, report) {
         'User-Agent': 'QueryGuard-CI',
     };
     try {
-        console.log(`[QueryGuard] Fetching existing PR comments from ${commentsUrl}...`);
         const listRes = await fetch(commentsUrl, { headers });
         let existingComment = null;
         if (listRes.ok) {
@@ -146,7 +147,7 @@ async function upsertGithubComment(token, report) {
                 : null;
         }
         if (existingComment) {
-            console.log(`[QueryGuard] Found existing report comment (ID: ${existingComment.id}). Updating in place...`);
+            console.log(`[QueryGuard] Updating report comment (ID: ${existingComment.id}) in place...`);
             const updateUrl = `https://api.github.com/repos/${repository}/issues/comments/${existingComment.id}`;
             const patchRes = await fetch(updateUrl, {
                 method: 'PATCH',
@@ -154,12 +155,11 @@ async function upsertGithubComment(token, report) {
                 body: JSON.stringify({ body: bodyWithMarker }),
             });
             if (patchRes.ok) {
-                console.log('[QueryGuard] In-place PR comment successfully updated.');
+                console.log('[QueryGuard] PR comment successfully updated in place.');
                 return;
             }
-            console.warn(`[QueryGuard] PATCH failed (Status ${patchRes.status}). Falling back to POST...`);
+            console.warn(`[QueryGuard] PATCH failed (${patchRes.status}). Falling back to POST...`);
         }
-        console.log(`[QueryGuard] Creating new comment...`);
         const postRes = await fetch(commentsUrl, {
             method: 'POST',
             headers,
@@ -191,24 +191,24 @@ async function run() {
     try {
         const resolvedSchema = path.resolve(config.schemaPath);
         console.log(`[QueryGuard] Inspecting schema DDL: ${resolvedSchema}`);
-        const ddl = fs.readFileSync(resolvedSchema, 'utf8');
-        // 1. Analyze Migration & DDL Locks First
-        const lockFindings = analyzeDDLLocks(ddl);
-        console.log(`[QueryGuard] Detected ${lockFindings.length} dangerous DDL lock patterns.`);
-        // 2. Apply Schema to Ephemeral PostgreSQL Database
-        await client.query(ddl);
+        const ddlRaw = fs.readFileSync(resolvedSchema, 'utf8');
+        const ddlStatements = splitSqlStatements(ddlRaw);
+        // 1. Analyze Migration DDL Locks
+        const lockFindings = analyzeDDLLocks(ddlStatements);
+        console.log(`[QueryGuard] Detected ${lockFindings.length} migration lock hazard(s).`);
+        // 2. Apply Schema DDL Statement-by-Statement (Allows CONCURRENTLY execution)
+        for (const stmt of ddlStatements) {
+            try {
+                await client.query(stmt);
+            }
+            catch (err) {
+                console.warn(`[QueryGuard] Warning: Failed applying DDL statement: "${stmt.substring(0, 40)}..." -> ${err.message}`);
+            }
+        }
         // 3. Evaluate SQL Query Plans
         const resolvedQueries = path.resolve(config.queriesPath);
         console.log(`[QueryGuard] Evaluating queries: ${resolvedQueries}`);
-        const rawSql = fs.readFileSync(resolvedQueries, 'utf8');
-        const sanitizedSql = rawSql
-            .split('\n')
-            .filter(line => !line.trim().startsWith('--'))
-            .join('\n');
-        const queryStatements = sanitizedSql
-            .split(';')
-            .map(q => q.trim())
-            .filter(q => q.length > 0);
+        const queryStatements = splitSqlStatements(fs.readFileSync(resolvedQueries, 'utf8'));
         const scanFindings = [];
         for (const sql of queryStatements) {
             try {
@@ -237,7 +237,7 @@ async function run() {
                         const col = extractColumn(node['Filter']);
                         const indexSql = col
                             ? `CREATE INDEX CONCURRENTLY idx_${table}_${col} ON ${table}(${col});`
-                            : `CREATE INDEX CONCURRENTLY idx_${table}_scan ON ${table}(/* columns */);`;
+                            : `CREATE INDEX CONCURRENTLY idx_${table}_scan ON${table}(/* columns */);`;
                         scanFindings.push({
                             query: sql,
                             totalCost: plan.Plan['Total Cost'],
@@ -261,7 +261,6 @@ async function run() {
         if (config.githubToken) {
             await upsertGithubComment(config.githubToken, reportMarkdown);
         }
-        // CI Gating: Block merge on unindexed scans OR blocking locks
         const criticalIssues = allFindings.filter(f => f.hasSeqScan || f.isLockRisk);
         if (criticalIssues.length > 0 && config.failOnSev1) {
             console.error(`\n[QueryGuard] CI GATING FAILURE: Detected ${criticalIssues.length} critical database risk(s).`);

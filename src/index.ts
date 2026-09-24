@@ -48,7 +48,7 @@ async function upsertGithubComment(token: string, report: string) {
   const repository = process.env.GITHUB_REPOSITORY;
 
   if (!prNumber || !repository) {
-    console.log(`[QueryGuard] Non-PR context (PR: ${prNumber}, Repo:${repository}); skipping comment.`);
+    console.log(`[QueryGuard] Non-PR context (PR: ${prNumber}, Repo: ${repository}); skipping comment.`);
     return;
   }
 
@@ -65,16 +65,13 @@ async function upsertGithubComment(token: string, report: string) {
     console.log(`[QueryGuard] Fetching existing PR comments from ${commentsUrl}...`);
     const listRes = await fetch(commentsUrl, { headers });
 
-    if (!listRes.ok) {
-      console.warn(`[QueryGuard] Could not list comments (Status ${listRes.status}). Posting new comment...`);
-      await fetch(commentsUrl, { method: 'POST', headers, body: JSON.stringify({ body: bodyWithMarker }) });
-      return;
+    let existingComment = null;
+    if (listRes.ok) {
+      const comments = await listRes.json();
+      existingComment = Array.isArray(comments)
+        ? comments.find((c: any) => c.body && c.body.includes(BOT_MARKER))
+        : null;
     }
-
-    const comments = await listRes.json();
-    const existingComment = Array.isArray(comments)
-      ? comments.find((c: any) => c.body && c.body.includes(BOT_MARKER))
-      : null;
 
     if (existingComment) {
       console.log(`[QueryGuard] Found existing report comment (ID: ${existingComment.id}). Updating in place...`);
@@ -87,24 +84,24 @@ async function upsertGithubComment(token: string, report: string) {
 
       if (patchRes.ok) {
         console.log('[QueryGuard] In-place PR comment successfully updated.');
-      } else {
-        const err = await patchRes.text();
-        console.error(`[QueryGuard] Failed updating comment: ${err}`);
+        return;
       }
-    } else {
-      console.log(`[QueryGuard] No prior comment with marker found. Creating new comment...`);
-      const postRes = await fetch(commentsUrl, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({ body: bodyWithMarker }),
-      });
+      console.warn(`[QueryGuard] PATCH failed (Status ${patchRes.status}). Falling back to POST...`);
+    }
 
-      if (postRes.ok) {
-        console.log('[QueryGuard] Successfully created initial PR comment.');
-      } else {
-        const err = await postRes.text();
-        console.error(`[QueryGuard] Failed posting comment: ${err}`);
-      }
+    // POST fallback if no existing comment or if PATCH failed
+    console.log(`[QueryGuard] Creating new comment...`);
+    const postRes = await fetch(commentsUrl, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ body: bodyWithMarker }),
+    });
+
+    if (postRes.ok) {
+      console.log('[QueryGuard] Successfully posted comment.');
+    } else {
+      const err = await postRes.text();
+      console.error(`[QueryGuard] Failed posting comment: ${err}`);
     }
   } catch (err: any) {
     console.error(`[QueryGuard] API error during comment upsert: ${err.message}`);
@@ -134,7 +131,6 @@ async function run() {
     console.log(`[QueryGuard] Evaluating queries: ${resolvedQueries}`);
     const rawSql = fs.readFileSync(resolvedQueries, 'utf8');
 
-    // Strip single-line comments line-by-line so multi-line queries are preserved
     const sanitizedSql = rawSql
       .split('\n')
       .filter(line => !line.trim().startsWith('--'))
@@ -179,7 +175,7 @@ async function run() {
             const col = extractColumn(node['Filter']);
             const indexSql = col 
               ? `CREATE INDEX CONCURRENTLY idx_${table}_${col} ON ${table}(${col});`
-              : `CREATE INDEX CONCURRENTLY idx_${table}_scan ON${table}(/* columns */);`;
+              : `CREATE INDEX CONCURRENTLY idx_${table}_scan ON ${table}(/* columns */);`;
 
             findings.push({
               query: sql,
@@ -201,12 +197,10 @@ async function run() {
     fs.writeFileSync('queryguard-report.md', reportMarkdown);
     console.log('\n' + reportMarkdown);
 
-    // Upsert the comment before exiting
     if (config.githubToken) {
       await upsertGithubComment(config.githubToken, reportMarkdown);
     }
 
-    // Block merge if critical sequential scans are present
     const severeCount = findings.filter(f => f.hasSeqScan).length;
     if (severeCount > 0 && config.failOnSev1) {
       console.error(`\n[QueryGuard] CI GATING FAILURE: Detected ${severeCount} unindexed query pattern(s) with critical blast-radius.`);
